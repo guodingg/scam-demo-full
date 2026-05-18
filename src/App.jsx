@@ -244,7 +244,7 @@ function Home({ scenes, onStart }) {
           ].map(x => (
             <div key={x.t} style={{ display: 'flex', gap: 12, alignItems: 'flex-start', padding: '10px 0', borderBottom: '1px solid #ffdcdb' }}>
               <span style={{ background: 'var(--danger)', color: 'white', padding: '2px 10px', borderRadius: 50, fontSize: '0.82rem', fontWeight: 700, flexShrink: 0 }}>{x.t}</span>
-              <span style={{ fontSize: '0.88rem', color: 'var(--text-light)' }}>{d}</span>
+              <span style={{ fontSize: '0.88rem', color: 'var(--text-light)' }}>{x.d}</span>
             </div>
           ))}
         </div>
