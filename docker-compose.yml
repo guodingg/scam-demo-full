@@ -1,0 +1,18 @@
+version: '3.8'
+
+services:
+  antiscam:
+    image: antiscam/frontend:latest
+    container_name: antiscam-demo
+    ports:
+      - "3000:3000"
+    environment:
+      - PORT=3000
+      - DATA_DIR=/app/data
+      - DB_PATH=/app/data/antiscam.db
+    volumes:
+      - antiscam-data:/app/data
+    restart: unless-stopped
+
+volumes:
+  antiscam-data:
