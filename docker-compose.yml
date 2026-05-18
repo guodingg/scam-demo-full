@@ -2,7 +2,7 @@ version: '3.8'
 
 services:
   antiscam:
-    image: antiscam/frontend:latest
+    image: antiscam-demo:latest
     container_name: antiscam-demo
     ports:
       - "3000:3000"
