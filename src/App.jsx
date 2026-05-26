@@ -1,6 +1,22 @@
 import { useState, useEffect, useRef } from 'react'
+import { AdminPanel } from './AdminPanel'
+import { TransferSimulation } from './TransferSimulation'
 
-const API = '/api'
+export const API = '/api'
+
+// ─── Config ───────────────────────────────────────────────────
+const DIM_CONFIG = {
+  scorePerTag: 15,
+  maxDimScore: 100,
+  balancedThreshold: 60,
+  tagMaps: {
+    '话术识别': ['识别诱饵','识破本质','识破伪造','识破异常','主动核实','核实信息','核实身份','查证识破','识破话术','识破套路','识破伪装','质疑来源','轻信熟人','轻信招聘','轻信短信'],
+    '紧急判断': ['质疑规则','质疑金额','质疑异常','质疑垫付','质疑安全','质疑权限','质疑计算','冲动报名','冲动垫付','冲动转账','冲动点击','恐慌反应','犹豫不决','犹豫','试探','接受任务','被迫继续'],
+    '止损意识': ['见好就收','止损觉醒','止损报警','止损退出','坚持提现','要求退款','要求退出','识破操作','沉没成本','继续垫付','继续转账','加大投入','大额垫付','继续任务','借贷转账','贷款转账','放弃止损','陷入困境','填写敏感信息','泄露验证码','接受复购'],
+    '证据保留': ['保留证据','记录聊天','核实单号'],
+    '报案流程': ['正确报警','报警','止损报警']
+  }
+}
 
 // ─── Auth helpers ──────────────────────────────────────────────
 const getStoredUser = () => {
@@ -27,11 +43,40 @@ const clearAuth = () => {
   localStorage.removeItem('user_id')
 }
 
-const authFetch = (url, options = {}) => {
+export const authFetch = (url, options = {}) => {
   const token = localStorage.getItem('access_token')
+  const refresh = localStorage.getItem('refresh_token')
   const headers = { ...(options.headers || {}), 'Content-Type': 'application/json' }
   if (token) headers['Authorization'] = 'Bearer ' + token
-  return fetch(url, { ...options, headers })
+  return fetch(url, { ...options, headers }).then(async res => {
+    // Token过期时自动刷新重试
+    if (res.status === 401 && refresh) {
+      try {
+        const r = await fetch(API + '/auth/refresh', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ refresh_token: refresh })
+        })
+        const data = await r.json()
+        if (r.ok && data.success && data.data) {
+          localStorage.setItem('access_token', data.data.access_token)
+          if (data.data.refresh_token) localStorage.setItem('refresh_token', data.data.refresh_token)
+          headers['Authorization'] = 'Bearer ' + data.data.access_token
+          return fetch(url, { ...options, headers })
+        } else {
+          // 刷新失败，清除登录状态
+          localStorage.removeItem('access_token')
+          localStorage.removeItem('refresh_token')
+          localStorage.removeItem('user_id')
+        }
+      } catch(e) {
+        localStorage.removeItem('access_token')
+        localStorage.removeItem('refresh_token')
+        localStorage.removeItem('user_id')
+      }
+    }
+    return res
+  })
 }
 
 // ─── Toast notification ────────────────────────────────────────
@@ -82,6 +127,42 @@ function AchievementModal({ achievement, onClose }) {
   )
 }
 
+// ─── Confirm Dialog ─────────────────────────────────────────────
+function ConfirmDialog({ title, message, onConfirm, onCancel }) {
+  return (
+    <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.6)', zIndex: 99999, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+      <div style={{ background: 'white', borderRadius: 16, padding: '28px 24px', maxWidth: 360, width: '90%', textAlign: 'center' }}>
+        <div style={{ fontSize: '2rem', marginBottom: 12 }}>⚠️</div>
+        <h3 style={{ margin: '0 0 8px', fontSize: '1.1rem' }}>{title}</h3>
+        <p style={{ margin: '0 0 20px', color: '#666', fontSize: '0.88rem' }}>{message}</p>
+        <div style={{ display: 'flex', gap: 12, justifyContent: 'center' }}>
+          <button onClick={onCancel} style={{ flex: 1, padding: '9px', background: '#f3f4f6', color: '#374151', border: 'none', borderRadius: 10, fontSize: '0.88rem', cursor: 'pointer' }}>取消</button>
+          <button onClick={onConfirm} style={{ flex: 1, padding: '9px', background: '#dc2626', color: 'white', border: 'none', borderRadius: 10, fontSize: '0.88rem', fontWeight: 700, cursor: 'pointer' }}>确认</button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+// ─── Bind Guest Modal ───────────────────────────────────────────
+function BindGuestModal({ onClose, onSubmit }) {
+  const [guestId, setGuestId] = useState('')
+  return (
+    <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.6)', zIndex: 9999, display: 'flex', alignItems: 'center', justifyContent: 'center' }} onClick={onClose}>
+      <div style={{ background: 'white', borderRadius: 16, padding: '28px 24px', maxWidth: 360, width: '90%' }} onClick={e => e.stopPropagation()}>
+        <h3 style={{ margin: '0 0 12px', fontSize: '1.1rem' }}>绑定游客账号</h3>
+        <p style={{ margin: '0 0 16px', color: '#666', fontSize: '0.85rem' }}>请输入您的游客账号ID（在个人中心查看），绑定后历史演练数据将合并到当前账号。</p>
+        <input value={guestId} onChange={e => setGuestId(e.target.value)} placeholder="请输入游客账号ID" style={{ width: '100%', boxSizing: 'border-box', padding: '9px 12px', borderRadius: 8, border: '1px solid var(--border)', fontSize: '0.9rem', marginBottom: 14 }} />
+        <div style={{ display: 'flex', gap: 10 }}>
+          <button onClick={onClose} style={{ flex: 1, padding: '9px', background: '#f3f4f6', color: '#374151', border: 'none', borderRadius: 10, fontSize: '0.88rem', cursor: 'pointer' }}>取消</button>
+          <button onClick={() => guestId.trim() && onSubmit(guestId.trim())} style={{ flex: 1, padding: '9px', background: 'var(--danger)', color: 'white', border: 'none', borderRadius: 10, fontSize: '0.88rem', fontWeight: 700, cursor: 'pointer' }}>确认绑定</button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+
 // ─── Auth Panel ─────────────────────────────────────────────────
 function AuthPanel({ onSuccess, onGuest, onClose }) {
   const [mode, setMode] = useState('login')
@@ -96,7 +177,7 @@ function AuthPanel({ onSuccess, onGuest, onClose }) {
     setError('')
     setLoading(true)
     try {
-      const endpoint = mode === 'register' ? '/api/auth/register' : '/api/auth/login'
+      const endpoint = mode === 'register' ? '/auth/register' : '/auth/login'
       const body = mode === 'register'
         ? { email, password, nickname }
         : { email, password }
@@ -119,7 +200,7 @@ function AuthPanel({ onSuccess, onGuest, onClose }) {
     setLoading(true)
     setError('')
     try {
-      const res = await fetch(API + '/api/auth/guest', { method: 'POST', headers: { 'Content-Type': 'application/json' } })
+      const res = await fetch(API + '/auth/guest', { method: 'POST', headers: { 'Content-Type': 'application/json' } })
       const d = await res.json()
       if (!d.success) { setError(d.error); setLoading(false); return }
       storeAuth(d.data)
@@ -163,16 +244,16 @@ function AuthPanel({ onSuccess, onGuest, onClose }) {
             <label style={{ display: 'block', fontSize: '0.8rem', color: '#666', marginBottom: 4 }}>密码{mode === 'register' ? '（至少6位）' : ''}</label>
             <input type="password" value={password} onChange={e => setPassword(e.target.value)} required placeholder="••••••••" style={{ width: '100%', boxSizing: 'border-box', padding: '9px 12px', borderRadius: 8, border: '1px solid #d1d5db', fontSize: '0.9rem' }} />
           </div>
-          <button type="submit" disabled={loading} style={{ width: '100%', padding: '11px', background: loading ? '#9ca3af' : 'var(--primary)', color: 'white', border: 'none', borderRadius: 10, fontSize: '0.95rem', fontWeight: 700, cursor: loading ? 'not-allowed' : 'pointer' }}>
+          <button type="submit" disabled={loading} style={{ width: '100%', padding: '11px', background: loading ? '#9ca3af' : 'var(--danger)', color: 'white', border: 'none', borderRadius: 10, fontSize: '0.95rem', fontWeight: 700, cursor: loading ? 'not-allowed' : 'pointer' }}>
             {loading ? '处理中...' : mode === 'login' ? '登录' : '注册'}
           </button>
         </form>
 
         <div style={{ display: 'flex', gap: 12, marginTop: 12 }}>
-          <button onClick={handleGuest} disabled={loading} style={{ flex: 1, padding: '9px', background: '#f3f4f6', color: '#374151', border: 'none', borderRadius: 10, fontSize: '0.85rem', cursor: loading ? 'not-allowed' : 'pointer' }}>
+          <button onClick={handleGuest} disabled={loading} style={{ flex: 1, padding: '9px', background: '#dc2626', color: 'white', border: 'none', borderRadius: 10, fontSize: '0.85rem', fontWeight: 600, cursor: loading ? 'not-allowed' : 'pointer' }}>
             游客试玩
           </button>
-          <button onClick={() => { setMode(mode === 'login' ? 'register' : 'login'); setError('') }} style={{ flex: 1, padding: '9px', background: 'white', color: 'var(--primary)', border: '1px solid var(--primary)', borderRadius: 10, fontSize: '0.85rem', cursor: 'pointer' }}>
+          <button onClick={() => { setMode(mode === 'login' ? 'register' : 'login'); setError('') }} style={{ flex: 1, padding: '9px', background: '#fff', color: '#dc2626', border: '2px solid #dc2626', borderRadius: 10, fontSize: '0.85rem', fontWeight: 600, cursor: 'pointer' }}>
             {mode === 'login' ? '注册新账号' : '去登录'}
           </button>
         </div>
@@ -211,16 +292,17 @@ function Nav({ active, onNav, isLoggedIn, user, onLoginClick }) {
 }
 
 // ─── Home ──────────────────────────────────────────────────────
-function Home({ scenes, onStart }) {
+function Home({ scenes, onStart, sceneFetchError }) {
+  if (sceneFetchError) return <div className="card" style={{color:'red',padding:20,textAlign:'center'}}>网络错误: {sceneFetchError}<br/><button onClick={() => window.location.reload()} style={{marginTop:10,padding:'8px 20px',background:'#e74c3c',color:'white',border:'none',borderRadius:8,cursor:'pointer'}}>重试</button></div>;
   return (
     <section id="home" className="section active">
-      <div className="card">
+    <div className="card">
         <h2 className="card-title"><span className="icon">🎯</span> 选择演练场景</h2>
         <p style={{ color: 'var(--text-light)', fontSize: '0.88rem', marginBottom: 20 }}>
           沉浸式体验诈骗套路，在安全环境中学习识别陷阱。选择一个场景开始吧。
         </p>
         <div className="scene-grid">
-          {scenes.map(s => (
+          {scenes.length === 0 ? <p style={{padding:'20px',textAlign:'center',color:'#999'}}>加载中...</p> : scenes.map(s => (
             <div key={s.id} className="scene-card" onClick={() => onStart(s.id)}>
               <span className="scene-num">{s.id}</span>
               <h3>{s.name}</h3>
@@ -267,10 +349,24 @@ function SceneDemo({ sceneId, scenes, onExit, onAchievements }) {
   const [sceneData, setSceneData] = useState(null)
   const chatRef = useRef(null)
   const [started, setStarted] = useState(false)
+  const [aiMode, setAiMode] = useState(false)
+  const [aiHistory, setAiHistory] = useState([])
+  const [aiInput, setAiInput] = useState('')
+  const [aiLoading, setAiLoading] = useState(false)
+  const [transferData, setTransferData] = useState(null)
+  const [pendingTransfer, setPendingTransfer] = useState(null) // 转账前等待用户确认
+  const [transferConfirmPending, setTransferConfirmPending] = useState(null) // 转账成功后触发AI
   const userId = localStorage.getItem('user_id')
 
   useEffect(() => {
     if (!sceneId) return
+    // Try embedded data first (bypasses Safari HTTP fetch restriction)
+    const embedded = window.__SCENES__?.find(s => s.id === sceneId)
+    if (embedded) {
+      setSceneData(embedded)
+      return
+    }
+    // Fallback to API fetch
     fetch(`${API}/scenes/${sceneId}`).then(r => r.json()).then(d => { if (d.data) setSceneData(d.data) }).catch(() => {})
   }, [sceneId])
 
@@ -304,15 +400,51 @@ function SceneDemo({ sceneId, scenes, onExit, onAchievements }) {
 
   useEffect(() => { if (chatRef.current) chatRef.current.scrollTop = chatRef.current.scrollHeight }, [messages])
 
+  // 转账成功后自动触发AI继续诈骗
+  useEffect(() => {
+    if (!transferConfirmPending || !aiMode) return
+    const amt = transferConfirmPending.amount
+    setTransferConfirmPending(null)
+    setAiLoading(true)
+    // 构造转账成功后的提示消息，让AI继续引导
+    const triggerMsg = `好的，我已转账 ¥${amt}，请确认收款后继续任务`
+    setMessages(prev => [...prev, { who: 'user', text: triggerMsg, time: new Date().toLocaleTimeString() }])
+    const msgs = [...aiHistory, { role: 'user', content: triggerMsg }]
+    authFetch(`${API}/ai/chat`, {
+      method: 'POST',
+      body: JSON.stringify({ scene_id: sceneId, demonstration_id: demoId, message: triggerMsg, history: msgs })
+    }).then(r => r.json()).then(d => {
+      if (d.success) {
+        const { reply, transfer, ended } = d.data
+        setAiHistory(prev => [...prev, { role: 'scammer', content: reply }])
+        setMessages(prev => [...prev, { who: 'scammer', text: reply, time: new Date().toLocaleTimeString() }])
+        if (transfer) {
+          setMessages(prev => [...prev, {
+            who: 'system',
+            text: `💰 对方请求转账：¥${transfer.amount} 给 "${transfer.recipient}"${transfer.note ? '（备注：' + transfer.note + '）' : ''}`,
+            time: new Date().toLocaleTimeString(),
+            transferData: transfer
+          }])
+          setPendingTransfer(transfer)
+        }
+        if (ended === 'scammed') {
+          setTimeout(() => setMessages(prev => [...prev, { who: 'system', text: '⚠️ 你已被骗！演练结束', time: '' }]), 1500)
+        }
+      }
+    }).catch(() => {}).finally(() => setAiLoading(false))
+  }, [transferConfirmPending])
+
   if (!scene) return <div className="container"><div className="card">加载中...</div></div>
 
   if (!started) {
     return (
       <div className="container">
-        <div className="edu-banner" style={{ cursor: 'pointer' }} onClick={() => setStarted(true)}>
-          <h2>⚠️ 【教育演示】非真实场景</h2>
-          <p>即将开始沉浸式演示：{activeScene.name}</p>
-          <p style={{ marginTop: 10, opacity: 0.7, fontSize: '0.82rem' }}>点击任意处开始</p>
+        <div style={{ padding: '0 16px 8px' }}>
+          <div className="edu-banner" style={{ cursor: 'pointer' }} onClick={() => { if (!aiMode) setStarted(true) }}>
+            <h2>⚠️ 【教育演示】非真实场景</h2>
+            <p>即将开始沉浸式演示：{activeScene.name}</p>
+            <p style={{ marginTop: 10, opacity: 0.7, fontSize: '0.82rem' }}>点击任意处开始（剧本模式）</p>
+          </div>
         </div>
         <div className="card">
           <h2 className="card-title"><span className="icon">📋</span> 场景说明</h2>
@@ -323,20 +455,27 @@ function SceneDemo({ sceneId, scenes, onExit, onAchievements }) {
             <li>您将通过聊天窗口体验诈骗分子的完整套路</li>
             <li>每个选择都有即时反馈，最终获得防骗能力评分</li>
           </ul>
-          <button className="choice-btn danger" style={{ marginTop: 16, justifyContent: 'center' }} onClick={() => setStarted(true)}>
-            <span className="ch-tag">▶</span><span>开始演练</span>
-          </button>
+          <div style={{ display: 'flex', gap: 10, marginTop: 16 }}>
+            <button className="choice-btn danger" style={{ flex: 1, justifyContent: 'center' }} onClick={() => setStarted(true)}>
+              <span className="ch-tag">▶</span><span>开始演练</span>
+            </button>
+            <button className="choice-btn" style={{ flex: 1, justifyContent: 'center', background: '#7c3aed' }} onClick={() => { setAiMode(true); setStarted(true) }}>
+              <span className="ch-tag">🤖</span><span>AI对话模式</span>
+            </button>
+          </div>
         </div>
       </div>
     )
   }
 
   const handleChoice = (choice) => {
-    if (selectedChoice) return
+    console.log('[DEBUG] handleChoice called, selectedChoice:', selectedChoice, 'choice:', choice.text)
+    if (selectedChoice) { console.log('[DEBUG] blocked - already selected'); return }
     setSelectedChoice(choice)
     const newScore = score + Math.max(0, choice.score)
     setScore(newScore)
     setTotalScore(totalScore + Math.max(0, choice.score))
+    console.log('[DEBUG] score now:', newScore)
 
     if (demoId) {
       authFetch(`${API}/demonstrations/${demoId}/actions`, {
@@ -348,17 +487,59 @@ function SceneDemo({ sceneId, scenes, onExit, onAchievements }) {
     setMessages(prev => [...prev, { who: 'user', text: choice.text, time: nowTime() }])
 
     setTimeout(() => {
+      console.log('[DEBUG] timeout firing, next:', choice.next)
       if (choice.next.includes('-end')) {
         setFinished(true)
       } else {
         const nextIdx = stages.findIndex(s => s.id === choice.next)
+        console.log('[DEBUG] nextIdx:', nextIdx, 'stages length:', stages.length)
         if (nextIdx !== -1) setStageIdx(nextIdx)
         else {
           const found = stages.findIndex(s => s.id.startsWith(choice.next.split('-')[0] + '-' + choice.next.split('-')[1]))
+          console.log('[DEBUG] found:', found)
           if (found !== -1) setStageIdx(found)
         }
       }
     }, 1800)
+  }
+
+  // ─── AI Chat ────────────────────────────────
+  const handleAiSend = async () => {
+    const text = aiInput.trim()
+    if (!text || aiLoading) return
+    setAiLoading(true)
+    setAiInput('')
+    setMessages(prev => [...prev, { who: 'user', text, time: new Date().toLocaleTimeString() }])
+    try {
+      const r = await authFetch(`${API}/ai/chat`, {
+        method: 'POST',
+        body: JSON.stringify({ scene_id: sceneId, demonstration_id: demoId, message: text, history: aiHistory })
+      })
+      const d = await r.json()
+      if (d.success) {
+        const { reply, transfer, ended } = d.data
+        setAiHistory(prev => [...prev, { role: 'user', content: text }, { role: 'scammer', content: reply }])
+        setMessages(prev => [...prev, { who: 'scammer', text: reply, time: new Date().toLocaleTimeString() }])
+        if (transfer) {
+          // 先在聊天框显示支付按钮，等用户点击确认后再弹出仿真界面
+          setMessages(prev => [...prev, {
+            who: 'system',
+            text: `💰 对方请求转账：¥${transfer.amount} 给 "${transfer.recipient}"${transfer.note ? '（备注：' + transfer.note + '）' : ''}`,
+            time: new Date().toLocaleTimeString(),
+            transferData: transfer // 附加转账数据用于渲染支付按钮
+          }])
+          setPendingTransfer(transfer)
+        }
+        if (ended === 'scammed') {
+          setTimeout(() => setMessages(prev => [...prev, { who: 'system', text: '⚠️ 你已被骗！演练结束', time: '' }]), 1500)
+        }
+      } else {
+        setMessages(prev => [...prev, { who: 'system', text: `错误: ${d.error}`, time: '' }])
+      }
+    } catch(e) {
+      setMessages(prev => [...prev, { who: 'system', text: `网络错误: ${e.message}`, time: '' }])
+    }
+    setAiLoading(false)
   }
 
   const handleEndDemo = (finalScore, riskLevel, weakDims) => {
@@ -432,26 +613,73 @@ function SceneDemo({ sceneId, scenes, onExit, onAchievements }) {
           <span style={{ color: 'var(--safe)', fontSize: '0.78rem', marginLeft: 8 }}>在线</span>
         </div>
         <div className="chat-box" ref={chatRef}>
-          {messages.map((m, i) => (<div key={i} className={`chat-msg ${m.who}`}><div className="bubble">{m.text}</div><div className="meta">{m.time || ''}</div></div>))}
+          {messages.map((m, i) => (<div key={i} className={`chat-msg ${m.who}`}><div className="bubble">{m.text}{m.transferData && <button style={{ marginTop: 10, background: '#07c160', color: '#fff', border: 'none', borderRadius: 20, padding: '8px 20px', fontSize: '0.85rem', fontWeight: 700, cursor: 'pointer', display: 'block', width: '100%' }} onClick={() => { setTransferData(m.transferData); setPendingTransfer(null) }}>确认支付 ¥{m.transferData.amount}</button>}</div><div className="meta">{m.time || ''}</div></div>))}
         </div>
         {currentStage?.riskPoints?.length > 0 && (
           <div className={`risk-panel ${showRisk ? 'show' : ''}`} style={{ margin: '0 16px 16px' }}>
             <h4>🚩 风险信号识别</h4>
-            {currentStage.riskPoints.map((r, i) => (<div key={i} className="risk-item"><span className="risk-kw">"{r.keyword}"</span><span className="risk-exp">{r.explanation}</span></div>))}
+            {currentStage.riskPoints.map((r, i) => (<div key={i} className="risk-item"><span className="risk-kw">"{r.flag || r.keyword}"</span><span className="risk-exp">{r.explain || r.explanation}</span></div>))}
           </div>
         )}
-        <div style={{ padding: '0 16px 16px' }}>
-          <div className="choices">
-            {(currentStage?.choices || []).map((c, i) => {
-              const letters = ['A', 'B', 'C', 'D']
-              return (
-                <button key={i} className={`choice-btn ${selectedChoice ? (selectedChoice.id === c.id ? c.type : 'disabled') : ''}`} onClick={() => handleChoice(c)} disabled={!!selectedChoice}>
-                  <span className="ch-tag">{letters[i]}</span><span>{c.text}</span>
-                </button>
-              )
-            })}
+        {/* 剧本模式选项 */}
+        {!aiMode && currentStage?.choices?.length > 0 && showRisk && (
+          <div className="choices" style={{ padding: '0 16px 16px' }}>
+            {currentStage.choices.map((c, i) => (
+              <button
+                key={i}
+                className={`choice-btn ${c.type || 'neutral'} ${selectedChoice ? 'disabled' : ''}`}
+                onClick={() => !selectedChoice && handleChoice(c)}
+                style={{ justifyContent: 'flex-start', textAlign: 'left' }}
+              >
+                <span className="ch-tag">{String.fromCharCode(65 + i)}</span>
+                <span>{c.text}</span>
+              </button>
+            ))}
           </div>
-        </div>
+        )}
+        {/* AI mode input */}
+        {aiMode && (
+          <div style={{ padding: '0 16px 16px' }}>
+            <div style={{ display: 'flex', gap: 8 }}>
+              <input
+                className="choice-btn"
+                style={{ flex: 1, padding: '10px 14px', borderRadius: 22, border: '1px solid #e5e7eb', fontSize: '0.9rem', background: '#fff' }}
+                placeholder="输入消息...（AI诈骗分子会诱导你转账）"
+                value={aiInput}
+                onChange={e => setAiInput(e.target.value)}
+                onKeyDown={e => { if (e.key === 'Enter' && !aiLoading) handleAiSend() }}
+                disabled={aiLoading}
+              />
+              <button className="choice-btn" style={{ padding: '10px 16px', background: aiLoading ? '#9ca3af' : '#7c3aed', borderRadius: 22, minWidth: 60 }} onClick={handleAiSend} disabled={aiLoading}>
+                {aiLoading ? '...' : '发送'}
+              </button>
+            </div>
+            <div style={{ marginTop: 8, fontSize: '0.78rem', color: aiMode ? '#ef4444' : '#6b7280' }}>
+              {aiMode ? '⚠️ AI对话模式：对方是模拟诈骗分子，请勿当真！' : '选择剧本模式开始演练'}
+            </div>
+          </div>
+        )}
+        {/* Transfer simulation overlay */}
+        {transferData && (
+          <TransferSimulation
+            amount={transferData.amount}
+            recipient={transferData.recipient}
+            note={transferData.note}
+            onConfirm={(result) => {
+              setTransferData(null)
+              const amt = result.amount
+              if (result.success) {
+                setMessages(prev => [...prev, { who: 'system', text: `✅ 转账成功：¥${amt} 已转出（模拟）`, time: new Date().toLocaleTimeString() }])
+                // 自动触发AI继续诈骗对话
+                setTransferConfirmPending({ amount: amt })
+              }
+            }}
+            onCancel={() => {
+              setTransferData(null)
+              setMessages(prev => [...prev, { who: 'system', text: `❌ 已取消转账：¥${transferData.amount}`, time: new Date().toLocaleTimeString() }])
+            }}
+          />
+        )}
       </div>
     </div>
   )
@@ -623,10 +851,10 @@ function AchievementsPanel({ userId, onClose }) {
 
   useEffect(() => {
     if (!userId) { setLoading(false); return }
-    authFetch(`${API}/api/users/${userId}/achievements`).then(r => r.json()).then(d => {
+    authFetch(`${API}/users/${userId}/achievements`).then(r => r.json()).then(d => {
       if (d.success) setUnlocked(d.data)
     }).catch(() => {})
-    authFetch(`${API}/api/achievements`).then(r => r.json()).then(d => {
+    authFetch(`${API}/achievements`).then(r => r.json()).then(d => {
       if (d.success) setData(d.data)
       setLoading(false)
     }).catch(() => setLoading(false))
@@ -670,48 +898,54 @@ function AchievementsPanel({ userId, onClose }) {
 }
 
 // ─── Profile ───────────────────────────────────────────────────
-function Profile({ userId, scenes, isLoggedIn, onLoginClick }) {
+function Profile({ userId, scenes, isLoggedIn, onLoginClick, onShowBindGuest, onShowAdmin, isAdmin }) {
   const [data, setData] = useState(null)
   const [loading, setLoading] = useState(true)
   const [showEdit, setShowEdit] = useState(false)
-  const [editForm, setEditForm] = useState({ nickname: '', age_group: '', fraud_experience: 'none' })
+  const [editForm, setEditForm] = useState({ nickname: '', age_group: '', fraud_experience: 'none', password: '' })
   const [saving, setSaving] = useState(false)
   const [showAch, setShowAch] = useState(false)
   const [userInfo, setUserInfo] = useState(null)
+  const [achUnlocked, setAchUnlocked] = useState(0)
+  const [allAchievements, setAllAchievements] = useState([])
 
   const loadStats = () => {
     if (!userId) { setLoading(false); return }
     setLoading(true)
-    authFetch(`${API}/api/users/${userId}/stats`).then(r => r.json()).then(d => { setData(d.data); setLoading(false) }).catch(() => setLoading(false))
+    authFetch(`${API}/users/${userId}/stats`).then(r => r.json()).then(d => { setData(d.data); setLoading(false) }).catch(() => setLoading(false))
   }
 
   const loadProfile = () => {
     if (!userId) return
-    authFetch(`${API}/api/users/${userId}`).then(r => r.json()).then(d => {
+    authFetch(`${API}/users/${userId}`).then(r => r.json()).then(d => {
       if (d.success && d.data) {
         setUserInfo(d.data)
-        setEditForm({ nickname: d.data.nickname || '', age_group: d.data.age_group || '', fraud_experience: d.data.fraud_experience || 'none' })
+        setEditForm({ nickname: d.data.nickname || '', age_group: d.data.age_group || '', fraud_experience: d.data.fraud_experience || 'none', password: '' })
       }
     }).catch(() => {})
   }
 
-  useEffect(() => { if (userId) { loadStats(); loadProfile() } }, [userId])
+  useEffect(() => { if (userId) { loadStats(); loadProfile(); authFetch(`${API}/achievements`).then(r => r.json()).then(d => { if (d.success) setAllAchievements(d.data) }).catch(() => {}); authFetch(`${API}/users/${userId}/achievements`).then(r => r.json()).then(d => { if (d.success) setAchUnlocked(d.data.length) }).catch(() => {}) } }, [userId])
 
   const handleSave = async () => {
     setSaving(true)
     try {
-      const res = await authFetch(`${API}/api/users/${userId}/profile`, {
+      const body = { nickname: editForm.nickname, age_group: editForm.age_group, fraud_experience: editForm.fraud_experience }
+      if (editForm.password) body.password = editForm.password
+      const res = await authFetch(`${API}/users/${userId}/profile`, {
         method: 'PUT',
-        body: JSON.stringify(editForm)
+        body: JSON.stringify(body)
       })
       const d = await res.json()
-      if (d.success) { setShowEdit(false); loadStats(); loadProfile() }
-    } catch(e) { console.error(e) }
+      if (d.success) { setShowEdit(false); setEditForm({ ...editForm, password: '' }); loadStats(); loadProfile(); setToast('保存成功') }
+      else setToast(d.error || '保存失败', 'error')
+    } catch(e) { console.error(e); setToast('保存失败', 'error') }
     setSaving(false)
   }
 
+
   const handleLogout = () => {
-    authFetch(`${API}/api/auth/logout`, { method: 'POST' }).catch(() => {})
+    authFetch(`${API}/auth/logout`, { method: 'POST' }).catch(() => {})
     clearAuth()
     window.location.reload()
   }
@@ -723,9 +957,9 @@ function Profile({ userId, scenes, isLoggedIn, onLoginClick }) {
           <div style={{ fontSize: '3rem', marginBottom: 16 }}>🔐</div>
           <h2 style={{ margin: '0 0 8px' }}>登录后可保存演练记录</h2>
           <p style={{ color: '#888', fontSize: '0.88rem', marginBottom: 20 }}>创建账号解锁完整成就体系，数据永久保存</p>
-          <button onClick={onLoginClick} style={{ background: 'var(--primary)', color: 'white', border: 'none', borderRadius: 10, padding: '11px 28px', fontSize: '0.95rem', fontWeight: 700, cursor: 'pointer' }}>立即登录 / 注册</button>
+          <button onClick={onLoginClick} style={{ background: 'var(--danger)', color: 'white', border: 'none', borderRadius: 10, padding: '11px 28px', fontSize: '0.95rem', fontWeight: 700, cursor: 'pointer' }}>立即登录 / 注册</button>
           <div style={{ marginTop: 12 }}>
-            <button onClick={() => onLoginClick(true)} style={{ background: 'none', border: 'none', color: '#888', fontSize: '0.82rem', cursor: 'pointer' }}>游客模式继续试玩 ▷</button>
+            <button onClick={onShowBindGuest} style={{ background: 'none', border: 'none', color: '#f59e0b', fontSize: '0.82rem', cursor: 'pointer', textDecoration: 'underline' }}>我有游客账号，绑定已有数据</button>
           </div>
         </div>
       </section>
@@ -750,11 +984,11 @@ function Profile({ userId, scenes, isLoggedIn, onLoginClick }) {
         <div className="card">
           <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
             <h2 className="card-title" style={{ margin: 0 }}><span className="icon">👤</span> 个人中心 {userInfo?.is_guest ? '(游客)' : ''}</h2>
-            <div style={{ display: 'flex', gap: 8 }}>
+            <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center' }}>
               <button onClick={() => setShowAch(true)} style={{ background: 'linear-gradient(135deg,#f59e0b,#d97706)', color: 'white', border: 'none', borderRadius: 8, padding: '6px 14px', fontSize: '0.82rem', cursor: 'pointer', fontWeight: 700 }}>
-                🏅 成就
+                🏅 {achUnlocked || 0}/{allAchievements.length}
               </button>
-              <button onClick={() => setShowEdit(!showEdit)} style={{ background: showEdit ? 'var(--border)' : 'var(--primary)', color: 'white', border: 'none', borderRadius: 8, padding: '6px 14px', fontSize: '0.82rem', cursor: 'pointer' }}>
+              <button onClick={() => setShowEdit(!showEdit)} style={{ background: showEdit ? 'var(--border)' : 'var(--danger)', color: 'white', border: 'none', borderRadius: 8, padding: '6px 14px', fontSize: '0.82rem', cursor: 'pointer' }}>
                 {showEdit ? '取消' : '编辑'}
               </button>
             </div>
@@ -791,7 +1025,11 @@ function Profile({ userId, scenes, isLoggedIn, onLoginClick }) {
                   <option value="较大损失">较大损失</option>
                 </select>
               </div>
-              <button onClick={handleSave} disabled={saving} style={{ width: '100%', padding: '10px', background: saving ? 'var(--border)' : 'var(--primary)', color: 'white', border: 'none', borderRadius: 8, fontSize: '0.9rem', fontWeight: 700, cursor: saving ? 'not-allowed' : 'pointer' }}>
+              <div style={{ marginBottom: 14 }}>
+                <label style={{ display: 'block', fontSize: '0.82rem', color: 'var(--text-light)', marginBottom: 4 }}>新密码（不修改请留空）</label>
+                <input type="password" value={editForm.password || ''} onChange={e => setEditForm({...editForm, password: e.target.value})} placeholder="留空则不修改" style={{ width: '100%', boxSizing: 'border-box', padding: '8px 10px', borderRadius: 8, border: '1px solid var(--border)', fontSize: '0.9rem', background: 'var(--bg)', color: 'var(--text)' }} />
+              </div>
+              <button onClick={handleSave} disabled={saving} style={{ width: '100%', padding: '10px', background: saving ? 'var(--border)' : 'var(--danger)', color: 'white', border: 'none', borderRadius: 8, fontSize: '0.9rem', fontWeight: 700, cursor: saving ? 'not-allowed' : 'pointer' }}>
                 {saving ? '保存中...' : '保存信息'}
               </button>
             </div>
@@ -854,13 +1092,28 @@ function Profile({ userId, scenes, isLoggedIn, onLoginClick }) {
           ) : <div style={{ textAlign: 'center', padding: '20px 0', color: 'var(--text-light)', fontSize: '0.88rem' }}>暂无演练记录</div>}
         </div>
 
-        {!userInfo?.is_guest && (
-          <div className="card">
-            <button onClick={handleLogout} style={{ width: '100%', padding: '10px', background: '#f9f9f9', color: '#dc2626', border: '1px solid #fca5a5', borderRadius: 10, fontSize: '0.88rem', fontWeight: 700, cursor: 'pointer' }}>
+        <div className="card" style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+          {isAdmin && (
+            <button onClick={onShowAdmin} style={{ width: '100%', padding: '10px', background: 'linear-gradient(135deg,#dc2626,#991b1b)', color: 'white', border: 'none', borderRadius: 10, fontSize: '0.88rem', fontWeight: 700, cursor: 'pointer' }}>
+              ⚙️ 后台管理
+            </button>
+          )}
+          {!userInfo?.is_guest && (
+            <button onClick={handleLogout} style={{ width: '100%', padding: '10px', background: '#f3f4f6', color: '#374151', border: 'none', borderRadius: 10, fontSize: '0.88rem', fontWeight: 700, cursor: 'pointer' }}>
               退出登录
             </button>
-          </div>
-        )}
+          )}
+          {!userInfo?.is_guest && (
+            <button onClick={() => { const token = localStorage.getItem('access_token'); fetch(`${API}/users/${userId}/export/pdf`, { headers: { Authorization: `Bearer ${token}` } }).then(r => { if (!r.ok) throw new Error('导出失败'); return r.blob(); }).then(blob => { const url = URL.createObjectURL(blob); const a = document.createElement('a'); a.href = url; a.download = 'user-data-report.pdf'; a.click(); URL.revokeObjectURL(url); setToast('PDF已导出') }).catch(e => { console.error(e); setToast('导出失败', 'error') }) }} style={{ width: '100%', padding: '10px', background: '#f3f4f6', color: '#374151', border: 'none', borderRadius: 10, fontSize: '0.88rem', cursor: 'pointer' }}>
+              📥 导出我的数据 (PDF)
+            </button>
+          )}
+          {!userInfo?.is_guest && (
+            <button onClick={() => setConfirmDialog({ title: '注销账号', message: '⚠️ 账号注销将删除所有演练记录、成就和历史数据，此操作不可逆！', onConfirm: () => { authFetch(`${API}/users/${userId}`, { method: 'DELETE' }).then(() => { clearAuth(); window.location.reload() }); setConfirmDialog(null) } })} style={{ width: '100%', padding: '10px', background: '#dc2626', color: 'white', border: 'none', borderRadius: 10, fontSize: '0.88rem', fontWeight: 700, cursor: 'pointer' }}>
+              🗑️ 注销账号
+            </button>
+          )}
+        </div>
       </section>
       {showAch && <AchievementsPanel userId={userId} onClose={() => setShowAch(false)} />}
     </>
@@ -881,6 +1134,11 @@ export default function App() {
   const [toast, setToast] = useState(null)
   const [achModal, setAchModal] = useState(null)
   const [toastList, setToastList] = useState([])
+  const [sceneFetchError, setSceneFetchError] = useState('')
+  const [confirmDialog, setConfirmDialog] = useState(null)
+  const [showBindGuest, setShowBindGuest] = useState(false)
+  const [showAdmin, setShowAdmin] = useState(false)
+  const [isAdmin, setIsAdmin] = useState(false)
 
   const storedUser = getStoredUser()
   const [userId, setUserId] = useState(() => {
@@ -891,8 +1149,37 @@ export default function App() {
   })
   const isLoggedIn = !!(storedUser && !storedUser.user.is_guest)
 
+  // Check if current user is admin
   useEffect(() => {
-    fetch(`${API}/api/scenes`).then(r => r.json()).then(d => setScenes(d.data || [])).catch(() => {})
+    if (storedUser && !storedUser.user.is_guest) {
+      authFetch(`${API}/users/${storedUser.user.id}`).then(r => r.json()).then(d => {
+        if (d.success && d.data) setIsAdmin(!!d.data.is_admin)
+      }).catch(() => {})
+    }
+  }, [storedUser])
+
+  const handleBindGuest = async (guestId) => {
+    try {
+      const res = await authFetch(`${API}/auth/bind-guest`, { method: 'POST', body: JSON.stringify({ guest_id: guestId }) })
+      const d = await res.json()
+      if (d.success) { setToast('账号绑定成功'); setShowBindGuest(false); setTimeout(() => window.location.reload(), 800) }
+      else setToast(d.error || '绑定失败', 'error')
+    } catch(e) { console.error(e); setToast('绑定失败', 'error') }
+  }
+
+  useEffect(() => {
+    // Load scenes from embedded static file (bypasses Safari HTTP fetch restriction)
+    if (window.__SCENES__) {
+      setScenes(window.__SCENES__)
+    } else {
+      console.warn('window.__SCENES__ not found, trying fetch...')
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 8000);
+      fetch(`${API}/api/scenes`, { signal: controller.signal })
+        .then(r => { clearTimeout(timeout); return r.json() })
+        .then(d => { if (d.data) setScenes(d.data) })
+        .catch(e => { clearTimeout(timeout); console.error('scenes load failed:', e) })
+    }
   }, [])
 
   const handleAuthSuccess = (data) => {
@@ -936,17 +1223,20 @@ export default function App() {
       <Nav active={nav} onNav={handleNav} isLoggedIn={isLoggedIn} user={storedUser} onLoginClick={() => setShowAuth(true)} />
 
       <div className="container">
-        {nav === 'home' && <Home scenes={scenes} onStart={handleStart} />}
+        {nav === 'home' && <Home scenes={scenes} onStart={handleStart} sceneFetchError={sceneFetchError} />}
         {nav === 'tips' && <Tips />}
         {nav === 'stats' && <Stats />}
-        {nav === 'profile' && <Profile userId={userId} scenes={scenes} isLoggedIn={isLoggedIn} onLoginClick={() => setShowAuth(true)} />}
+        {nav === 'profile' && <Profile userId={userId} scenes={scenes} isLoggedIn={isLoggedIn} onLoginClick={() => setShowAuth(true)} onShowBindGuest={() => setShowBindGuest(true)} onShowAdmin={() => setShowAdmin(true)} isAdmin={isAdmin} />}
         {nav === 'demo' && activeScene && (
           <SceneDemo key={activeScene} sceneId={activeScene} scenes={scenes} onExit={handleExit} onAchievements={handleAchievements} />
         )}
       </div>
 
       {showAuth && <AuthPanel onSuccess={handleAuthSuccess} onGuest={handleAuthGuest} onClose={() => setShowAuth(false)} />}
+      {showAdmin && <AdminPanel onClose={() => setShowAdmin(false)} />}
       {achModal && <AchievementModal achievement={achModal} onClose={() => setAchModal(null)} />}
+      {showBindGuest && <BindGuestModal onClose={() => setShowBindGuest(false)} onSubmit={handleBindGuest} />}
+      {confirmDialog && <ConfirmDialog title={confirmDialog.title} message={confirmDialog.message} onConfirm={() => { confirmDialog.onConfirm(); setConfirmDialog(null) }} onCancel={() => setConfirmDialog(null)} />}
       {toast && <Toast message={toast} type="info" onClose={() => setToast(null)} />}
     </div>
   )

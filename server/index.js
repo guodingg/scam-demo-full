@@ -20,6 +20,26 @@ const db = new Database(DB_PATH);
 db.pragma('journal_mode = WAL');
 db.pragma('foreign_keys = ON');
 
+// In-memory rate limiting: { ip: { count, resetAt } }
+const authRateLimit = {};
+const RATE_LIMIT_WINDOW = 60 * 1000; // 1 minute
+const RATE_LIMIT_MAX = 10; // max 10 auth requests per minute
+
+const checkRateLimit = (req, res, type) => {
+  const ip = req.ip || req.connection.remoteAddress || 'unknown';
+  const key = `${ip}:${type}`;
+  const now = Date.now();
+  if (!authRateLimit[key] || authRateLimit[key].resetAt < now) {
+    authRateLimit[key] = { count: 1, resetAt: now + RATE_LIMIT_WINDOW };
+    return true;
+  }
+  if (authRateLimit[key].count >= RATE_LIMIT_MAX) {
+    return false;
+  }
+  authRateLimit[key].count++;
+  return true;
+};
+
 db.exec(`
 CREATE TABLE IF NOT EXISTS users (
   id TEXT PRIMARY KEY,
@@ -29,6 +49,8 @@ CREATE TABLE IF NOT EXISTS users (
   age_group TEXT,
   fraud_experience TEXT DEFAULT 'none',
   is_guest INTEGER DEFAULT 0,
+  is_admin INTEGER DEFAULT 0,
+  linked_guest_id TEXT,
   created_at INTEGER DEFAULT (unixepoch())
 );
 
@@ -71,6 +93,33 @@ CREATE TABLE IF NOT EXISTS system_configs (
   key TEXT PRIMARY KEY,
   value TEXT,
   updated_at INTEGER DEFAULT (unixepoch())
+);
+
+CREATE TABLE IF NOT EXISTS ai_configs (
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  scene TEXT NOT NULL,
+  provider TEXT NOT NULL,
+  model TEXT NOT NULL,
+  api_key TEXT,
+  base_url TEXT,
+  system_prompt TEXT,
+  config_params TEXT,
+  enabled INTEGER DEFAULT 1,
+  is_default INTEGER DEFAULT 0,
+  display_order INTEGER DEFAULT 0,
+  created_by TEXT,
+  created_at INTEGER DEFAULT (unixepoch()),
+  updated_at INTEGER DEFAULT (unixepoch())
+);
+
+CREATE TABLE IF NOT EXISTS ai_chat_history (
+  id TEXT PRIMARY KEY,
+  demonstration_id TEXT,
+  user_id TEXT NOT NULL,
+  role TEXT NOT NULL,
+  content TEXT NOT NULL,
+  created_at INTEGER DEFAULT (unixepoch())
 );
 
 CREATE TABLE IF NOT EXISTS achievements (
@@ -260,12 +309,12 @@ const checkAchievements = (userId) => {
 app.use(cors());
 app.use(express.json());
 app.use(authenticateToken);
-app.use(express.static(path.join(__dirname, '../dist')));
 
 // ─── Auth Routes ───────────────────────────────────────────────
 
 // Register
 app.post('/api/auth/register', async (req, res) => {
+  if (!checkRateLimit(req, res, 'register')) return res.status(429).json({ success: false, error: '操作过于频繁，请1分钟后再试' });
   const { email, password, nickname } = req.body;
   if (!email || !password) return res.status(400).json({ success: false, error: '邮箱和密码不能为空' });
   if (password.length < 6) return res.status(400).json({ success: false, error: '密码至少6位' });
@@ -285,6 +334,7 @@ app.post('/api/auth/register', async (req, res) => {
 
 // Login
 app.post('/api/auth/login', async (req, res) => {
+  if (!checkRateLimit(req, res, 'login')) return res.status(429).json({ success: false, error: '登录次数超限，请1分钟后再试' });
   const { email, password } = req.body;
   if (!email || !password) return res.status(400).json({ success: false, error: '邮箱和密码不能为空' });
 
@@ -298,7 +348,7 @@ app.post('/api/auth/login', async (req, res) => {
   const { accessToken, refreshToken } = signTokens(user.id);
   saveRefreshToken(user.id, refreshToken);
 
-  res.json({ success: true, data: { user_id: user.id, access_token: accessToken, refresh_token: refreshToken, user: { id: user.id, email: user.email, nickname: user.nickname || '', is_guest: false } } });
+  res.json({ success: true, data: { user_id: user.id, access_token: accessToken, refresh_token: refreshToken, user: { id: user.id, email: user.email, nickname: user.nickname || '', is_guest: false, is_admin: !!user.is_admin } } });
 });
 
 // Refresh token
@@ -324,6 +374,70 @@ app.post('/api/auth/logout', requireAuth, (req, res) => {
   res.json({ success: true });
 });
 
+// Change password
+app.put('/api/auth/password', requireAuth, async (req, res) => {
+  const { old_password, new_password } = req.body;
+  if (!old_password || !new_password) return res.status(400).json({ success: false, error: '旧密码和新密码都不能为空' });
+  if (new_password.length < 6) return res.status(400).json({ success: false, error: '新密码至少6位' });
+  if (old_password === new_password) return res.status(400).json({ success: false, error: '新密码不能与旧密码相同' });
+
+  const user = db.prepare('SELECT * FROM users WHERE id = ?').get(req.userId);
+  if (!user) return res.status(404).json({ success: false, error: '用户不存在' });
+  if (user.is_guest) return res.status(400).json({ success: false, error: '游客账号不支持修改密码，请先注册正式账号' });
+
+  const valid = await bcrypt.compare(old_password, user.password_hash);
+  if (!valid) return res.status(401).json({ success: false, error: '旧密码错误' });
+
+  const password_hash = await bcrypt.hash(new_password, 12);
+  db.prepare('UPDATE users SET password_hash = ? WHERE id = ?').run(password_hash, req.userId);
+  res.json({ success: true, message: '密码修改成功' });
+});
+
+// Guest binding: migrate guest data to registered account
+app.post('/api/auth/bind-guest', requireAuth, async (req, res) => {
+  const guest_id = req.body.guest_id;
+  if (!guest_id) return res.status(400).json({ success: false, error: 'guest_id required' });
+  const user = db.prepare('SELECT * FROM users WHERE id = ?').get(req.userId);
+  if (!user) return res.status(404).json({ success: false, error: '用户不存在' });
+  if (!user.is_guest) return res.status(400).json({ success: false, error: '只有游客账号才能绑定' });
+
+
+  // Migrate demonstrations and actions from guest to current user
+  db.prepare('UPDATE user_demonstrations SET user_id = ? WHERE user_id = ?').run(req.userId, guest_id);
+  db.prepare('UPDATE user_achievements SET user_id = ? WHERE user_id = ?').run(req.userId, guest_id);
+  db.prepare('UPDATE auth_tokens SET user_id = ? WHERE user_id = ?').run(req.userId, guest_id);
+  // Mark guest as migrated
+  db.prepare('UPDATE users SET linked_guest_id = ?, email = ? WHERE id = ?').run(guest_id, user.email, req.userId);
+  db.prepare('DELETE FROM users WHERE id = ?').run(guest_id);
+  res.json({ success: true, message: '账号绑定成功，历史演练数据已保留' });
+});
+
+// Export user data (GDPR)
+app.get('/api/users/:id/export', requireAuth, (req, res) => {
+  if (req.userId !== req.params.id) return res.status(403).json({ success: false, error: '无权限' });
+  const user = db.prepare('SELECT id, email, nickname, age_group, fraud_experience, is_guest, created_at FROM users WHERE id = ?').get(req.userId);
+  if (!user) return res.status(404).json({ success: false, error: '用户不存在' });
+  const demos = db.prepare('SELECT * FROM user_demonstrations WHERE user_id = ?').all(req.userId);
+  const achs = db.prepare('SELECT a.*, ua.unlocked_at FROM user_achievements ua JOIN achievements a ON a.id = ua.achievement_id WHERE ua.user_id = ?').all(req.userId);
+  res.json({ success: true, data: { user, demonstrations: demos, achievements: achs } });
+});
+
+
+// Delete user account (GDPR)
+app.delete('/api/users/:id', requireAuth, (req, res) => {
+  if (req.userId !== req.params.id) return res.status(403).json({ success: false, error: '无权限' });
+  const user = db.prepare('SELECT * FROM users WHERE id = ?').get(req.userId);
+  if (!user) return res.status(404).json({ success: false, error: '用户不存在' });
+  if (user.is_guest) return res.status(400).json({ success: false, error: '游客账号无法注销，请注册正式账号' });
+
+  db.prepare('DELETE FROM user_actions WHERE demonstration_id IN (SELECT id FROM user_demonstrations WHERE user_id = ?)').run(req.userId);
+  db.prepare('DELETE FROM user_demonstrations WHERE user_id = ?').run(req.userId);
+  db.prepare('DELETE FROM user_achievements WHERE user_id = ?').run(req.userId);
+  db.prepare('DELETE FROM auth_tokens WHERE user_id = ?').run(req.userId);
+  db.prepare('DELETE FROM users WHERE id = ?').run(req.userId);
+  res.json({ success: true, message: '账号已注销' });
+});
+
 // Guest mode - create anonymous account
 app.post('/api/auth/guest', (req, res) => {
   const guestId = 'guest_' + uuidv4().replace(/-/g, '').slice(0, 16);
@@ -338,12 +452,22 @@ app.post('/api/auth/guest', (req, res) => {
 
 // ─── Scenes ───────────────────────────────────────────────────
 app.get('/api/scenes', (req, res) => {
-  const list = Object.values(scenesData).map(s => ({
-    id: s.id, name: s.name, category: s.category,
-    description: s.description, difficulty: s.difficulty,
-    estimated_time: s.estimated_time
-  }));
-  res.json({ success: true, data: list });
+  try {
+    const list = Object.values(scenesData).map(s => ({
+      id: s.id, name: s.name, category: s.category,
+      description: s.description, difficulty: s.difficulty,
+      estimated_time: s.estimated_time
+    }));
+    console.log('[DEBUG] /api/scenes returning', list.length, 'items');
+    res.json({ success: true, data: list });
+  } catch(e) {
+    console.error('[ERROR] /api/scenes:', e);
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+app.get('/api/ping', (req, res) => {
+  res.json({ success: true, message: 'pong', ts: Date.now() });
 });
 
 app.get('/api/scenes/:id', (req, res) => {
@@ -441,22 +565,26 @@ app.get('/api/users/:id', (req, res) => {
   if (!user) return res.status(404).json({ success: false, error: 'User not found' });
   // Only allow owner or same-user access
   if (req.userId && user.id !== req.userId) return res.status(403).json({ success: false, error: '无权限' });
-  res.json({ success: true, data: { id: user.id, email: user.email || '', nickname: user.nickname || '', age_group: user.age_group || '', fraud_experience: user.fraud_experience || 'none', is_guest: !!user.is_guest, created_at: user.created_at } });
+  res.json({ success: true, data: { id: user.id, email: user.email || '', nickname: user.nickname || '', age_group: user.age_group || '', fraud_experience: user.fraud_experience || 'none', is_guest: !!user.is_guest, is_admin: !!user.is_admin, created_at: user.created_at } });
 });
 
 app.put('/api/users/:id/profile', (req, res) => {
   if (req.userId && req.userId !== req.params.id) return res.status(403).json({ success: false, error: '无权限' });
-  const { nickname, age_group, fraud_experience } = req.body;
+  const { nickname, age_group, fraud_experience, password } = req.body;
   const updates = [], params = [];
   if (nickname !== undefined) { updates.push('nickname = ?'); params.push(nickname); }
   if (age_group !== undefined) { updates.push('age_group = ?'); params.push(age_group); }
   if (fraud_experience !== undefined) { updates.push('fraud_experience = ?'); params.push(fraud_experience); }
+  if (password !== undefined && password !== '') {
+    if (password.length < 6) return res.status(400).json({ success: false, error: '密码至少6位' });
+    updates.push('password_hash = ?'); params.push(bcrypt.hashSync(password, 10));
+  }
   if (updates.length === 0) return res.status(400).json({ success: false, error: 'No fields to update' });
   params.push(req.params.id);
   try {
     db.prepare('UPDATE users SET ' + updates.join(', ') + ' WHERE id = ?').run(...params);
     const user = db.prepare('SELECT * FROM users WHERE id = ?').get(req.params.id);
-    res.json({ success: true, data: { id: user.id, email: user.email || '', nickname: user.nickname, age_group: user.age_group, fraud_experience: user.fraud_experience } });
+    res.json({ success: true, data: { id: user.id, email: user.email || '', nickname: user.nickname, age_group: user.age_group, fraud_experience: user.fraud_experience, is_guest: !!user.is_guest } });
   } catch(e) { res.status(500).json({ success: false, error: e.message }); }
 });
 
@@ -530,11 +658,288 @@ app.get('/api/users/:id/achievements', (req, res) => {
   res.json({ success: true, data: userAchs });
 });
 
-// ─── SPA fallback ──────────────────────────────────────────────
+// ─── Admin: AI Configs (per-scene multi-provider) ───────────────────────
+app.get('/api/admin/ai-configs', requireAuth, (req, res) => {
+  const user = db.prepare('SELECT is_admin FROM users WHERE id = ?').get(req.userId);
+  if (!user?.is_admin) return res.status(403).json({ success: false, error: '需要管理员权限' });
+  const { scene, provider } = req.query;
+  let query = 'SELECT * FROM ai_configs WHERE 1=1';
+  const params = [];
+  if (scene) { query += ' AND scene = ?'; params.push(scene); }
+  if (provider) { query += ' AND provider = ?'; params.push(provider); }
+  query += ' ORDER BY display_order, created_at DESC';
+  const configs = db.prepare(query).all(...params);
+  res.json({ success: true, data: configs.map(c => ({ ...c, api_key: c.api_key ? '[已设置]' : '[未设置]' })) });
+});
+
+app.post('/api/admin/ai-configs', requireAuth, (req, res) => {
+  const user = db.prepare('SELECT is_admin FROM users WHERE id = ?').get(req.userId);
+  if (!user?.is_admin) return res.status(403).json({ success: false, error: '需要管理员权限' });
+  const { name, scene, provider, model, api_key, base_url, system_prompt, config_params, enabled, is_default, display_order } = req.body;
+  if (!name || !scene || !provider || !model) return res.status(400).json({ success: false, error: 'name, scene, provider, model 必填' });
+  if (is_default) db.prepare('UPDATE ai_configs SET is_default = 0 WHERE scene = ?').run(scene);
+  const id = require('uuid').v4();
+  db.prepare(`INSERT INTO ai_configs (id, name, scene, provider, model, api_key, base_url, system_prompt, config_params, enabled, is_default, display_order, created_by)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+    id, name, scene, provider, model, api_key || '', base_url || '', system_prompt || '',
+    JSON.stringify(config_params || {}), enabled !== false ? 1 : 0, is_default ? 1 : 0, display_order || 0, req.userId
+  );
+  const config = db.prepare('SELECT * FROM ai_configs WHERE id = ?').get(id);
+  res.json({ success: true, data: { ...config, api_key: config.api_key ? '[已设置]' : '[未设置]' } });
+});
+
+app.put('/api/admin/ai-configs/:id', requireAuth, (req, res) => {
+  const user = db.prepare('SELECT is_admin FROM users WHERE id = ?').get(req.userId);
+  if (!user?.is_admin) return res.status(403).json({ success: false, error: '需要管理员权限' });
+  const config = db.prepare('SELECT * FROM ai_configs WHERE id = ?').get(req.params.id);
+  if (!config) return res.status(404).json({ success: false, error: '配置不存在' });
+  const { name, scene, provider, model, api_key, base_url, system_prompt, config_params, enabled, is_default, display_order } = req.body;
+  if (is_default && !config.is_default) db.prepare('UPDATE ai_configs SET is_default = 0 WHERE scene = ?').run(scene || config.scene);
+  const fields = ['name','scene','provider','model','base_url','system_prompt','config_params','enabled','is_default','display_order'];
+  const values = { name, scene, provider, model, base_url, system_prompt, config_params, enabled, is_default, display_order };
+  const updates = []; const params = [];
+  for (const f of fields) {
+    if (values[f] !== undefined) {
+      updates.push(`${f} = ?`);
+      params.push(f === 'config_params' ? JSON.stringify(values[f]) : (f === 'enabled' || f === 'is_default' ? (values[f] ? 1 : 0) : values[f]));
+    }
+  }
+  if (api_key) { updates.push('api_key = ?'); params.push(api_key); }
+  updates.push('updated_at = unixepoch()');
+  params.push(req.params.id);
+  db.prepare(`UPDATE ai_configs SET ${updates.join(', ')} WHERE id = ?`).run(...params);
+  const updated = db.prepare('SELECT * FROM ai_configs WHERE id = ?').get(req.params.id);
+  res.json({ success: true, data: { ...updated, api_key: updated.api_key ? '[已设置]' : '[未设置]' } });
+});
+
+app.delete('/api/admin/ai-configs/:id', requireAuth, (req, res) => {
+  const user = db.prepare('SELECT is_admin FROM users WHERE id = ?').get(req.userId);
+  if (!user?.is_admin) return res.status(403).json({ success: false, error: '需要管理员权限' });
+  const config = db.prepare('SELECT * FROM ai_configs WHERE id = ?').get(req.params.id);
+  if (!config) return res.status(404).json({ success: false, error: '配置不存在' });
+  db.prepare('DELETE FROM ai_configs WHERE id = ?').run(req.params.id);
+  res.json({ success: true });
+});
+
+app.get('/api/admin/scenes-list', requireAuth, (req, res) => {
+  const user = db.prepare('SELECT is_admin FROM users WHERE id = ?').get(req.userId);
+  if (!user?.is_admin) return res.status(403).json({ success: false, error: '需要管理员权限' });
+  const scenes = db.prepare('SELECT DISTINCT scene FROM ai_configs ORDER BY scene').all().map(r => r.scene);
+  res.json({ success: true, data: scenes });
+});
+
+app.post('/api/admin/users/:id/toggle-admin', requireAuth, (req, res) => {
+  const user = db.prepare('SELECT is_admin FROM users WHERE id = ?').get(req.userId);
+  if (!user?.is_admin) return res.status(403).json({ success: false, error: '需要管理员权限' });
+  if (req.params.id === req.userId) return res.status(400).json({ success: false, error: '不能修改自己的管理员状态' });
+  const target = db.prepare('SELECT * FROM users WHERE id = ?').get(req.params.id);
+  if (!target) return res.status(404).json({ success: false, error: '用户不存在' });
+  const newVal = target.is_admin ? 0 : 1;
+  db.prepare('UPDATE users SET is_admin = ? WHERE id = ?').run(newVal, req.params.id);
+  res.json({ success: true, data: { is_admin: newVal } });
+});
+
+// ─── AI Chat ──────────────────────────────────────────────────
+const AI_PROVIDERS = {
+  minimax: { baseUrl: 'https://api.minimaxi.chat/v1', model: 'MiniMax-M2.7', name: 'MiniMax' },
+  moonshot: { baseUrl: 'https://api.moonshot.cn/v1', model: 'moonshot-v1-8k', name: 'Kimi' },
+  openai: { baseUrl: 'https://api.openai.com/v1', model: 'gpt-4o-mini', name: 'OpenAI' },
+  qwen: { baseUrl: 'https://dashscope.aliyuncs.com/compatible-mode/v1', model: 'qwen-plus', name: '通义千问' },
+  wenxin: { baseUrl: 'https://aip.baidubce.com/rpc/2.0/ai_custom/v1', model: 'ernie-4.0-8k-latest', name: '文心一言' },
+  custom: { baseUrl: '', model: '', name: '自定义' },
+  deepseek: { baseUrl: 'https://api.deepseek.com/v1', model: 'deepseek-chat', name: 'DeepSeek' },
+};
+
+const getAiConfig = () => {
+  try {
+    const row = db.prepare('SELECT value FROM system_configs WHERE key = ?').get('ai_config');
+    return row ? JSON.parse(row.value) : { provider: 'minimax', api_key: '', model: '' };
+  } catch(e) { return { provider: 'minimax', api_key: '', model: '' }; }
+};
+
+const saveAiConfig = (config) => {
+  db.prepare('INSERT OR REPLACE INTO system_configs (key, value, updated_at) VALUES (?, ?, unixepoch())').run('ai_config', JSON.stringify(config));
+};
+
+const callAi = async (messages, userId, sceneId) => {
+  // Find AI config for this scene, fallback to system default
+  let config = { provider: 'minimax', api_key: '', model: '' };
+  try {
+    if (sceneId) {
+      const row = db.prepare('SELECT * FROM ai_configs WHERE scene = ? AND enabled = 1 ORDER BY is_default DESC, display_order ASC LIMIT 1').get(sceneId);
+      if (row && row.api_key) {
+        config = { provider: row.provider, api_key: row.api_key, model: row.model, base_url: row.base_url || '' };
+      }
+    }
+    if (!config.api_key) {
+      const sys = db.prepare('SELECT value FROM system_configs WHERE key = ?').get('ai_config');
+      if (sys) { const c = JSON.parse(sys.value); if (c.api_key) config = c; }
+    }
+  } catch(e) { /* fallback to defaults */ }
+  if (!config.api_key) throw new Error('AI未配置，请管理员在后台设置API密钥');
+  const provider = AI_PROVIDERS[config.provider] || AI_PROVIDERS.minimax;
+  const baseUrl = config.base_url || provider.baseUrl;
+  const endpoint = baseUrl + '/chat/completions';
+  const body = { model: config.model || provider.model, messages, stream: false };
+  const headers = { 'Content-Type': 'application/json', 'Authorization': `Bearer ${config.api_key}` };
+  if (config.provider === 'wenxin') {
+    headers['Authorization'] = `Bearer ${config.api_key}`;
+  }
+  const res = await fetch(endpoint, { method: 'POST', headers, body: JSON.stringify(body) });
+  if (!res.ok) {
+    const err = await res.text();
+    throw new Error(`AI请求失败: ${res.status} ${err}`);
+  }
+  const data = await res.json();
+  return data.choices?.[0]?.message?.content || '';
+};
+
+// Admin: get AI config
+app.get('/api/admin/ai-config', requireAuth, (req, res) => {
+  const user = db.prepare('SELECT is_admin FROM users WHERE id = ?').get(req.userId);
+  if (!user?.is_admin) return res.status(403).json({ success: false, error: '需要管理员权限' });
+  const config = getAiConfig();
+  config.api_key = config.api_key ? config.api_key.slice(0, 6) + '***' + config.api_key.slice(-4) : '';
+  res.json({ success: true, data: config });
+});
+
+// Admin: update AI config
+app.put('/api/admin/ai-config', requireAuth, (req, res) => {
+  const user = db.prepare('SELECT is_admin FROM users WHERE id = ?').get(req.userId);
+  if (!user?.is_admin) return res.status(403).json({ success: false, error: '需要管理员权限' });
+  const { provider, api_key, model } = req.body;
+  if (!provider) return res.status(400).json({ success: false, error: 'provider required' });
+  const current = getAiConfig();
+  saveAiConfig({ provider, api_key: api_key || current.api_key, model: model || AI_PROVIDERS[provider]?.model || '' });
+  res.json({ success: true });
+});
+
+// Admin: dashboard stats
+app.get('/api/admin/stats', requireAuth, (req, res) => {
+  const user = db.prepare('SELECT is_admin FROM users WHERE id = ?').get(req.userId);
+  if (!user?.is_admin) return res.status(403).json({ success: false, error: '需要管理员权限' });
+  const totalUsers = db.prepare('SELECT COUNT(*) as c FROM users WHERE is_guest = 0').get().c;
+  const todayStart = Math.floor(Date.now() / 1000) - 86400;
+  const todayDemos = db.prepare('SELECT COUNT(*) as c FROM user_demonstrations WHERE start_time > ?').get(todayStart).c;
+  const totalDemos = db.prepare('SELECT COUNT(*) as c FROM user_demonstrations WHERE status != ?').get('in_progress').c;
+  const avgScore = db.prepare('SELECT AVG(final_score) as avg FROM user_demonstrations WHERE final_score IS NOT NULL').get().avg || 0;
+  const sceneStats = db.prepare('SELECT scene_id, COUNT(*) as count FROM user_demonstrations GROUP BY scene_id ORDER BY count DESC LIMIT 6').all();
+  res.json({ success: true, data: { total_users: totalUsers, today_demos: todayDemos, total_demos: totalDemos, avg_score: Math.round(avgScore), scene_stats: sceneStats } });
+});
+
+// Admin: list users (paginated)
+app.get('/api/admin/users', requireAuth, (req, res) => {
+  const user = db.prepare('SELECT is_admin FROM users WHERE id = ?').get(req.userId);
+  if (!user?.is_admin) return res.status(403).json({ success: false, error: '需要管理员权限' });
+  const page = parseInt(req.query.page) || 1;
+  const limit = 20;
+  const offset = (page - 1) * limit;
+  const users = db.prepare('SELECT id, email, nickname, is_guest, is_admin, created_at FROM users ORDER BY created_at DESC LIMIT ? OFFSET ?').all(limit, offset);
+  const total = db.prepare('SELECT COUNT(*) as c FROM users').get().c;
+  res.json({ success: true, data: { users, total, page, pages: Math.ceil(total / limit) } });
+});
+
+// Admin: list today's demos
+app.get('/api/admin/demos', requireAuth, (req, res) => {
+  const user = db.prepare('SELECT is_admin FROM users WHERE id = ?').get(req.userId);
+  if (!user?.is_admin) return res.status(403).json({ success: false, error: '需要管理员权限' });
+  const todayStart = Math.floor(Date.now() / 1000) - 86400;
+  const demos = db.prepare(`
+    SELECT ud.id, ud.user_id, ud.scene_id, ud.status, ud.final_score, ud.start_time,
+      u.nickname, u.email
+    FROM user_demonstrations ud
+    LEFT JOIN users u ON u.id = ud.user_id
+    WHERE ud.start_time > ?
+    ORDER BY ud.start_time DESC
+    LIMIT 50
+  `).all(todayStart);
+  res.json({ success: true, data: demos });
+});
+
+// AI Chat: send message (non-streaming for simplicity)
+app.post('/api/ai/chat', requireAuth, (req, res) => {
+  const { scene_id, demonstration_id, message, history } = req.body;
+  if (!message?.trim()) return res.status(400).json({ success: false, error: '消息不能为空' });
+  const scene = scenesData[scene_id];
+  if (!scene) return res.status(404).json({ success: false, error: '场景不存在' });
+  const userId = req.userId;
+  const demoId = demonstration_id || null;
+  // Build system prompt
+  const systemPrompt = `你是一个诈骗分子，正在模拟"${scene.name}"诈骗场景。
+诈骗类型: ${scene.category}
+场景描述: ${scene.description}
+你的角色设定: ${scene.ai_persona || '一个狡猾的诈骗分子，善于利用心理弱点诱导受害者转账。'}
+
+要求:
+1. 完全沉浸在角色中，用聊天的方式一步步诱导用户
+2. 当需要让用户转账时，生成一个"转账面板"格式指令: [TRANSFER:金额:收款人:备注]
+3. 不要透露自己是AI或提及任何关于诈骗教育的内容
+4. 用户在尝试"防范"，你要绕过他们的防备
+5. 回复简短自然，像真实聊天（1-3句话）
+6. 当用户明确拒绝或表现出警惕时，不要强迫，换个角度继续
+7. 如果用户已经转账或被骗成功，可以结束对话并输出 [END:诈骗成功]
+8. 如果用户识破骗局，可以输出 [END:用户识破]`;
+  const msgs = [{ role: 'system', content: systemPrompt }];
+  if (history && history.length > 0) msgs.push(...history.map(h => ({ role: h.role === 'scammer' ? 'assistant' : 'user', content: h.content })));
+  msgs.push({ role: 'user', content: message });
+  callAi(msgs, userId, scene_id).then(reply => {
+    // Save to history
+    const id1 = uuidv4(), id2 = uuidv4();
+    db.prepare('INSERT INTO ai_chat_history (id, demonstration_id, user_id, role, content) VALUES (?, ?, ?, ?, ?)').run(id1, demoId, userId, 'user', message);
+    db.prepare('INSERT INTO ai_chat_history (id, demonstration_id, user_id, role, content) VALUES (?, ?, ?, ?, ?)').run(id2, demoId, userId, 'scammer', reply);
+    // Parse transfer指令
+    let transfer = null;
+    const transferMatch = reply.match(/\[TRANSFER:([^:]+):([^:]+):([^\]]+)\]/);
+    if (transferMatch) {
+      transfer = { amount: transferMatch[1], recipient: transferMatch[2], note: transferMatch[3] };
+    }
+    const ended = reply.includes('[END:') ? (reply.includes('诈骗成功') ? 'scammed' : 'detected') : null;
+    res.json({ success: true, data: { reply, transfer, ended } });
+  }).catch(err => {
+    res.status(500).json({ success: false, error: err.message });
+  });
+});
+
+// AI Chat: get history for a demo
+app.get('/api/ai/chat/:demoId', requireAuth, (req, res) => {
+  const history = db.prepare('SELECT role, content, created_at FROM ai_chat_history WHERE demonstration_id = ? ORDER BY created_at ASC').all(req.params.demoId);
+  res.json({ success: true, data: history });
+});
+
+const distIndexPath = path.join(__dirname, '../dist/index.html');
+
+// ─── SPA fallback + static assets (must be last) ────────────────────────
 app.get('*', (req, res) => {
-  const distIndex = path.join(__dirname, '../dist/index.html');
-  if (fs.existsSync(distIndex)) res.sendFile(distIndex);
-  else res.send('<p>Build the frontend first: <code>npm run build</code></p>');
+  const url = req.path;
+  // Serve static assets from /app/dist/assets/
+  if (url.startsWith('/assets/')) {
+    const filePath = path.join(__dirname, '../dist', url);
+    if (fs.existsSync(filePath)) {
+      const ext = path.extname(url);
+      const mimeTypes = {
+        '.js': 'application/javascript',
+        '.css': 'text/css',
+        '.html': 'text/html',
+        '.json': 'application/json',
+        '.png': 'image/png',
+        '.jpg': 'image/jpeg',
+        '.svg': 'image/svg+xml',
+      };
+      res.type(mimeTypes[ext] || 'application/octet-stream').sendFile(filePath);
+      return;
+    }
+  }
+  // Inject scenes data into index.html for all other routes
+  if (fs.existsSync(distIndexPath)) {
+    let html = fs.readFileSync(distIndexPath, 'utf8');
+    const scenesJson = JSON.stringify(Object.values(scenesData));
+    const inject = `<script>window.__SCENES__=${scenesJson};</script>`;
+    // Inject BEFORE the first script tag (works regardless of hashed filename)
+    html = html.replace(/<script type="module"/, inject + '<script type="module"');
+    res.type('html').send(html);
+  } else {
+    res.send('<p>Build the frontend first: <code>npm run build</code></p>');
+  }
 });
 
 app.listen(PORT, () => {
